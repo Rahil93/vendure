@@ -1,6 +1,7 @@
 import { expect, test } from '@playwright/test';
 
 import { LoginPage } from '../../page-objects/login-page.js';
+import { VendureAdminClient } from '../../utils/vendure-admin-client.js';
 
 // These tests need a clean browser with no saved auth state
 test.use({ storageState: { cookies: [], origins: [] } });
@@ -29,6 +30,100 @@ test.describe('Login', () => {
     test('should redirect to login when accessing protected route unauthenticated', async ({ page }) => {
         await page.goto('/products');
         await expect(page).toHaveURL(/\/login/);
+    });
+});
+
+// Switching to an administrator scoped to a different channel used to show only the
+// Dashboard tab until a hard refresh. No page.reload(): a reload recreates the
+// QueryClient and masks the bug.
+test.describe('Switching users', () => {
+    test("should show the new user's permitted tabs after switching users without reloading", async ({
+        page,
+    }) => {
+        test.setTimeout(60_000);
+        const suffix = Date.now();
+        const password = 'test-password';
+
+        const client = new VendureAdminClient(page);
+        await client.login();
+        const zones = await client.gql(
+            `query { zones(options: { filter: { name: { eq: "Europe" } } }) { items { id } } }`,
+        );
+        const zoneId = zones.zones.items[0]?.id as string;
+        expect(zoneId).toBeTruthy();
+        const { createChannel } = await client.gql(
+            `mutation ($input: CreateChannelInput!) {
+                createChannel(input: $input) {
+                    ... on Channel { id }
+                    ... on ErrorResult { errorCode message }
+                }
+            }`,
+            {
+                input: {
+                    code: `business-store-${suffix}`,
+                    token: `business-store-${suffix}`,
+                    defaultLanguageCode: 'en',
+                    pricesIncludeTax: false,
+                    defaultCurrencyCode: 'USD',
+                    availableCurrencyCodes: ['USD'],
+                    defaultTaxZoneId: zoneId,
+                    defaultShippingZoneId: zoneId,
+                },
+            },
+        );
+        expect(createChannel.id).toBeTruthy();
+
+        // Creates a role (on the default channel unless channelIds is given) and an
+        // administrator with it, returning the administrator's email address.
+        async function createAdmin(name: string, channelIds?: string[]) {
+            const emailAddress = `${name}-${suffix}@test.com`;
+            const { createRole } = await client.gql(
+                `mutation ($input: CreateRoleInput!) { createRole(input: $input) { id } }`,
+                {
+                    input: {
+                        code: `${name}-${suffix}`,
+                        description: name,
+                        permissions: ['ReadCatalog', 'ReadOrder'],
+                        channelIds,
+                    },
+                },
+            );
+            await client.gql(
+                `mutation ($input: CreateAdministratorInput!) { createAdministrator(input: $input) { id } }`,
+                {
+                    input: {
+                        firstName: name,
+                        lastName: 'User',
+                        emailAddress,
+                        password,
+                        roleIds: [createRole.id],
+                    },
+                },
+            );
+            return emailAddress;
+        }
+        // Not the superadmin: logout deletes all of a user's sessions, which would also
+        // sign out the shared superadmin storage state used by the other suites.
+        const [defaultChannelAdmin, businessAdmin] = await Promise.all([
+            createAdmin('default-channel'),
+            createAdmin('business', [createChannel.id]),
+        ]);
+
+        const loginPage = new LoginPage(page);
+        const sidebar = page.locator('[data-slot="sidebar"]');
+
+        await loginPage.goto();
+        await loginPage.login(defaultChannelAdmin, password);
+        await expect(sidebar.getByText('Catalog', { exact: true })).toBeVisible({ timeout: 15_000 });
+
+        await page.locator('[data-slot="sidebar-footer"]').getByRole('button').first().click();
+        await page.getByRole('menuitem', { name: 'Log out' }).click();
+        await expect(page).toHaveURL(/\/login/);
+
+        await loginPage.login(businessAdmin, password);
+        await expect(page).not.toHaveURL(/\/login/, { timeout: 15_000 });
+        await expect(sidebar.getByText('Catalog', { exact: true })).toBeVisible({ timeout: 15_000 });
+        await expect(sidebar.getByText('Sales', { exact: true })).toBeVisible();
     });
 });
 

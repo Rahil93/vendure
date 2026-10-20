@@ -215,6 +215,11 @@ export function AuthProvider({ children }: Readonly<{ children: React.ReactNode 
                             }
                             setActiveChannelId(channel.id);
                         }
+                        // Cancel active queries still in flight under the previous user's channel
+                        // token: invalidateQueries() reuses the pending request of a query with no
+                        // data yet, so its FORBIDDEN result would stick. Only active ones, so a
+                        // route loader's ensureQueryData() is not rejected.
+                        await queryClient.cancelQueries({ type: 'active' });
                         // Invalidate all queries to ensure fresh data after login
                         await queryClient.invalidateQueries();
                         setStatus('authenticated');
